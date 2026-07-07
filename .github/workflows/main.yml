@@ -1,0 +1,28 @@
+name: CI - Test Suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Docker Compose proof suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show Docker versions
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Run proof suite
+        run: make test
+
+      - name: Tear down compose stack
+        if: always()
+        run: make down ARGS=-v

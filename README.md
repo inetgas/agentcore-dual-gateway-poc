@@ -4,6 +4,13 @@
 > ReAct agent on an AgentCore Runtime stand-in, **separate model and tool gateways**, per-tool
 > OAuth 2.0 scoping, OIDC PKCE user auth, and end-to-end OpenTelemetry observability.
 
+[![CI - Test Suite](https://github.com/inetgas/agentcore-dual-gateway-poc/actions/workflows/main.yml/badge.svg)](https://github.com/inetgas/agentcore-dual-gateway-poc/actions/workflows/main.yml)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Runtime](https://img.shields.io/badge/Runtime-Docker%20Compose-2496ED)
+![Python](https://img.shields.io/badge/Python-3.11-blue)
+![Frontend](https://img.shields.io/badge/Frontend-React%20%2B%20Vite-646CFF)
+![Agent](https://img.shields.io/badge/Agent-LangGraph-orange)
+
 Companion code to the article **Building a Production-Grade Agentic AI Platform on AWS
 Bedrock AgentCore: What Decisions were Made and Why**. The article explains the *why*
 (and describes the real production platform); this repo is a local, runnable *how*.
