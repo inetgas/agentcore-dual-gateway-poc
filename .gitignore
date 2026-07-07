@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+*.local
+
+# OS / editor / tooling
+.DS_Store
+.qodo/
+.idea/
+.vscode/
+
+# Logs & local env
+*.log
+.env
+.env.*
+!.env.example
+
+# Docker local volumes (data is recreated on `docker compose up`)
+**/pgdata/

@@ -1,0 +1,62 @@
+# OTel Collector — single, always-on config (Decision 4 two-tier).
+#
+# ONE config in all modes (this is deliberate — see below). Same incoming spans, two
+# pipelines:
+#   traces/jaeger   → Jaeger   RAW   (in-data-plane backend; allowed to see content)
+#   traces/langfuse → Langfuse REDACTED (PII stripped by the transform processor first)
+#
+# Why one config and not a per-mode override: if the Langfuse-vs-Jaeger choice lived in
+# the Collector's `command` (via a compose override), ANY compose call without that
+# override file — e.g. `docker compose run tests`, which reconciles the
+# tests→runtime→otel-collector dependency chain — would recreate the Collector on the
+# other config and silently stop forwarding to Langfuse. With one always-on config, no
+# command can misconfigure it.
+#
+# The Langfuse override (docker-compose.langfuse.yml) only STARTS the Langfuse containers.
+# When they're not running (the lightweight default), the langfuse exporter below fail-fast
+# no-ops (retry + queue disabled), so Jaeger is unaffected and there's no retry spam.
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+
+processors:
+  batch: {}
+  # PII redaction for the observability backend. Blanket replace across all string
+  # attribute values, so prompt/response content (langfuse.*.input/output) is scrubbed.
+  transform/redact:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - 'replace_all_patterns(attributes, "value", "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[EMAIL]")'
+          - 'replace_all_patterns(attributes, "value", "\\d{3}-\\d{2}-\\d{4}", "[SSN]")'
+          - 'replace_all_patterns(attributes, "value", "\\d{3}[-.]\\d{3}[-.]\\d{4}", "[PHONE]")'
+          - 'replace_all_patterns(attributes, "value", "\\d{4}[ -]\\d{4}[ -]\\d{4}[ -]\\d{4}", "[CARD]")'
+
+exporters:
+  otlp_grpc/jaeger:
+    endpoint: jaeger:4317
+    tls: { insecure: true }
+  otlphttp/langfuse:
+    endpoint: http://langfuse-web:3000/api/public/otel
+    headers:
+      Authorization: "Basic cGstbGYtZGVtby0wMDAwMDAwMDAwMDAwMDAwOnNrLWxmLWRlbW8tMDAwMDAwMDAwMDAwMDAwMA=="
+    # When Langfuse isn't running (default mode), fail fast and drop — don't queue/retry.
+    timeout: 5s
+    retry_on_failure: { enabled: false }
+    sending_queue: { enabled: false }
+
+service:
+  telemetry:
+    logs: { level: warn }
+  pipelines:
+    traces/jaeger:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_grpc/jaeger]
+    traces/langfuse:
+      receivers: [otlp]
+      processors: [transform/redact, batch]
+      exporters: [otlphttp/langfuse]

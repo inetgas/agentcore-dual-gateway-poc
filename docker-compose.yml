@@ -1,0 +1,127 @@
+# agentcore-dual-gateway-poc — full inbound + outbound auth chain, runnable locally.
+#
+#   docker compose up --build
+#     Frontend  http://localhost:5173   (Okta OIDC PKCE login → chat)
+#     mock-okta http://localhost:8081   (OIDC provider)
+#     runtime   http://localhost:8080   (AgentCore Runtime: inbound JWT authorizer)
+#
+#   Proof suite:  docker compose --profile test run --rm tests
+services:
+  pgvector:
+    image: pgvector/pgvector:pg16
+    environment: { POSTGRES_PASSWORD: poc_only, POSTGRES_DB: rag }
+    healthcheck: { test: ["CMD-SHELL","pg_isready -U postgres -d rag"], interval: 2s, timeout: 3s, retries: 20 }
+
+  mock-okta:
+    build: ./services/mock-okta
+    environment:
+      OKTA_ISSUER: http://localhost:8081/oauth2/default
+      USER_AUDIENCE: mvp-runtime
+      M2M_AUDIENCE: mvp-kong-gateway
+    ports: ["8081:8080"]
+    healthcheck: { test: ["CMD","python","-c","import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"], interval: 2s, timeout: 3s, retries: 20 }
+
+  mock-bedrock:
+    build: ./services/mock-bedrock
+    healthcheck: { test: ["CMD","python","-c","import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"], interval: 2s, timeout: 3s, retries: 20 }
+
+  mock-memory:
+    build: ./services/mock-memory
+    depends_on: { pgvector: { condition: service_healthy } }
+    environment: { PGHOST: pgvector, PGUSER: postgres, PGPASSWORD: poc_only, PGDATABASE: rag, PGSSLMODE: disable }
+    healthcheck: { test: ["CMD","python","-c","import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"], interval: 2s, timeout: 3s, retries: 20 }
+
+  # AgentCore Gateway (the MCP gateway for tools) — stands in for AWS AgentCore Gateway.
+  # Exposes retrieve_documents + submit_ticket as MCP tools; validates the inbound JWT and
+  # enforces per-tool scope (tool.retrieve / tool.submit_ticket). Tool logic + pgvector.
+  mock-agentcore-gateway:
+    build: ./services/mock-agentcore-gateway
+    depends_on: { pgvector: { condition: service_healthy } }
+    environment:
+      PGHOST: pgvector
+      PGUSER: postgres
+      PGPASSWORD: poc_only
+      PGDATABASE: rag
+      PGSSLMODE: disable
+      CORPUS_DIR: /corpus
+      OKTA_HS_SECRET: mock-okta-hs256-shared-secret   # validate Okta-signed M2M tokens
+    volumes: ["./corpus:/corpus:ro"]
+    healthcheck: { test: ["CMD","python","-c","import socket;socket.create_connection(('localhost',9000),2)"], interval: 2s, timeout: 3s, retries: 30 }
+
+  # Kong is the MODEL gateway only (chat + embeddings -> mock-bedrock). Tools moved to
+  # AgentCore Gateway above.
+  kong:
+    image: kong/kong-gateway:3.14
+    depends_on:
+      mock-okta: { condition: service_healthy }
+      mock-bedrock: { condition: service_healthy }
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yaml
+      KONG_LICENSE_MODE: free
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_STATUS_LISTEN: 0.0.0.0:8100
+      KONG_ADMIN_LISTEN: "off"
+      KONG_NGINX_WORKER_PROCESSES: "1"
+    volumes: ["./services/kong/kong.yaml:/kong/kong.yaml:ro"]
+    healthcheck: { test: ["CMD-SHELL","kong health || exit 1"], interval: 3s, timeout: 3s, retries: 30 }
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    environment: { COLLECTOR_OTLP_ENABLED: "true" }
+    ports: ["16686:16686"]
+
+  # Single OTel egress: the runtime emits OTLP here; the Collector fans out to the
+  # backends via ONE always-on config — Jaeger (raw) + Langfuse (PII-redacted, Decision 4).
+  # When Langfuse isn't running, its exporter fail-fast no-ops (Jaeger is unaffected). The
+  # config never changes by mode, so no compose command can misconfigure forwarding.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes: ["./services/otel-collector:/etc/otel:ro"]
+    depends_on:
+      jaeger: { condition: service_started }
+
+  runtime:
+    build: ./services/runtime
+    depends_on:
+      kong: { condition: service_healthy }                       # model gateway
+      mock-agentcore-gateway: { condition: service_healthy }     # MCP tool gateway
+      mock-okta: { condition: service_healthy }
+      mock-memory: { condition: service_healthy }
+      otel-collector: { condition: service_started }             # single OTel egress
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317   # runtime → Collector → backends
+      OTEL_SERVICE_NAME: mvp-orchestrator
+      EXPECTED_ISSUER: http://localhost:8081/oauth2/default
+      EXPECTED_AUDIENCE: mvp-runtime
+      DISCOVERY_URL: http://mock-okta:8080/oauth2/default/.well-known/openid-configuration
+      JWKS_URI: http://mock-okta:8080/oauth2/default/v1/keys
+      ALLOWED_SCOPES: ""
+      OKTA_TOKEN_URL: http://mock-okta:8080/oauth2/default/v1/token
+      OKTA_CLIENT_ID: mvp-orchestrator-client
+      OKTA_CLIENT_SECRET: mvp-orchestrator-secret
+      KONG_URL: http://kong:8000                                 # model reasoning hop
+      GATEWAY_MCP_URL: http://mock-agentcore-gateway:9000/mcp     # tool calls (MCP)
+      MEMORY_URL: http://mock-memory:8080
+      MEMORY_ID: mvp-memory
+    ports: ["8080:8080"]
+    healthcheck: { test: ["CMD","python","-c","import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"], interval: 2s, timeout: 3s, retries: 30 }
+
+  frontend:
+    build: ./frontend
+    depends_on: { runtime: { condition: service_healthy } }
+    ports: ["5173:80"]
+
+  tests:
+    profiles: ["test"]
+    build: ./tests
+    depends_on:
+      runtime: { condition: service_healthy }
+      mock-okta: { condition: service_healthy }
+    environment:
+      RUNTIME_URL: http://runtime:8080
+      OKTA_INTERNAL: http://mock-okta:8080/oauth2/default
+    command: ["pytest","-v"]

@@ -1,0 +1,204 @@
+# =============================================================================
+# PRODUCTION reference: OTel Collector with TAIL SAMPLING  (illustrative, not wired
+# into docker-compose — the PoC uses services/otel-collector/config.yaml).
+#
+# This is the **Tier-2 (tail-sampler)** config. Tail sampling decides keep/drop AFTER a
+# trace finishes, using trace-level facts (errored? slow? touched a consequential tool?),
+# so it needs every span of a trace on ONE Collector instance. That requires a two-tier
+# layout:
+#
+#   runtime / gateways / tools ──OTLP──▶ Tier-1 "agent" collectors (stateless, scale freely)
+#                                          exporter: loadbalancing (routing_key: traceID)
+#                                          └─ all spans of trace T ─▶ same Tier-2 pod
+#                                                                     ▼
+#                                        Tier-2 "tail-sampler" collectors  ← THIS FILE
+#                                          tail_sampling + redaction + fan-out to backends
+#
+# The Tier-1 loadbalancing config is in the commented APPENDIX at the bottom.
+#
+# Key principle: SAMPLE TRACES, NEVER SAMPLE METRICS. The spanmetrics connector computes
+# RED metrics from 100% of spans BEFORE tail sampling, so dashboards/SLOs stay accurate
+# while only the "interesting" traces are retained for debugging.
+#
+# Secrets come from env (${env:...}); set DD_API_KEY, DD_SITE, LANGFUSE_OTLP_AUTH, etc.
+# =============================================================================
+
+extensions:
+  health_check: { endpoint: 0.0.0.0:13133 }
+  zpages: { endpoint: 0.0.0.0:55679 }      # /debug/tracez — inspect in-flight sampling decisions
+
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }      # receives whole traces from the Tier-1 loadbalancers
+      http: { endpoint: 0.0.0.0:4318 }
+
+connectors:
+  # Generates RED (rate/errors/duration) metrics from the FULL span stream, pre-sampling.
+  # Used as an exporter in the traces/metrics-source pipeline and a receiver in metrics/out.
+  spanmetrics:
+    histogram:
+      explicit: { buckets: [10ms, 50ms, 100ms, 250ms, 500ms, 1s, 3s, 10s, 30s] }
+    dimensions:                              # keep these span attributes as metric labels
+      - { name: route }                      # research / submit_ticket / clarify
+      - { name: gen_ai.request.model }
+      - { name: auth.scope }
+    exemplars: { enabled: true }             # link metrics → sampled exemplar traces
+
+processors:
+  # memory_limiter MUST be first — tail sampling buffers traces in RAM; this is the backstop
+  # that sheds load instead of OOM-killing the Collector.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # PII redaction for the observability backend (same idea as the PoC's config.yaml).
+  # In prod, prefer a service-backed redactor; regex is the floor, not the ceiling.
+  transform/redact:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - 'replace_all_patterns(attributes, "value", "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[EMAIL]")'
+          - 'replace_all_patterns(attributes, "value", "\\d{3}-\\d{2}-\\d{4}", "[SSN]")'
+          - 'replace_all_patterns(attributes, "value", "\\d{3}[-.]\\d{3}[-.]\\d{4}", "[PHONE]")'
+          - 'replace_all_patterns(attributes, "value", "\\d{4}[ -]\\d{4}[ -]\\d{4}[ -]\\d{4}", "[CARD]")'
+
+  # ---- Tail sampling: one processor PER backend, so each gets backend-appropriate volume.
+  # Within a processor the `policies` list is OR'd: a trace is KEPT if ANY policy matches.
+
+  # Datadog (SRE / cost-sensitive): errors + slow + consequential actions + small baseline.
+  tail_sampling/sre:
+    decision_wait: 20s            # must exceed your longest trace; agent tool-loops can be long
+    num_traces: 200000            # in-flight traces held in memory (sizing knob)
+    expected_new_traces_per_sec: 2000
+    policies:
+      - name: errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: slow
+        type: latency
+        latency: { threshold_ms: 3000 }
+      - name: consequential-tools          # keep 100% of turns that took a real side-effect
+        type: string_attribute
+        string_attribute: { key: auth.scope, values: [tool.submit_ticket] }
+      - name: expensive-generation         # cost guardrail: keep runaway-token turns
+        type: numeric_attribute
+        numeric_attribute: { key: gen_ai.usage.output_tokens, min_value: 4000 }
+      - name: baseline                      # representative sample of the boring rest
+        type: probabilistic
+        probabilistic: { sampling_percentage: 5 }
+      - name: safety-rate-cap              # never exceed N kept traces/sec regardless
+        type: rate_limiting
+        rate_limiting: { spans_per_second: 1500 }
+
+  # Langfuse (LLM eval): want a richer corpus — all errors, all tool-using turns, all
+  # low-quality outputs, plus a higher baseline for representativeness.
+  tail_sampling/llm:
+    decision_wait: 20s
+    num_traces: 200000
+    policies:
+      - name: errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: any-tool-call                 # keep every turn that called a tool
+        type: string_attribute
+        string_attribute: { key: auth.scope, values: [tool.retrieve, tool.submit_ticket] }
+      - name: low-eval-score                # if you write eval scores back as a span attr
+        type: numeric_attribute
+        numeric_attribute: { key: eval.score, min_value: 0, max_value: 50 }
+      - name: baseline
+        type: probabilistic
+        probabilistic: { sampling_percentage: 20 }
+
+  batch:
+    send_batch_size: 1000
+    timeout: 5s
+
+exporters:
+  # SRE view — Datadog (traces + the full-fidelity metrics from spanmetrics).
+  datadog:
+    api: { key: ${env:DD_API_KEY}, site: ${env:DD_SITE} }
+
+  # LLM view — Langfuse (OTLP/HTTP, redacted + tail-sampled).
+  otlphttp/langfuse:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}        # e.g. https://cloud.langfuse.com/api/public/otel
+    headers: { Authorization: ${env:LANGFUSE_OTLP_AUTH} }   # "Basic base64(pk:sk)"
+    retry_on_failure: { enabled: true }
+    sending_queue: { enabled: true, queue_size: 5000 }
+
+  # OPTIONAL "raw, in-data-plane" tap (Decision-4 two-tier): an in-VPC backend allowed to
+  # see un-redacted content. Often UNsampled or lightly sampled for forensic retention.
+  # otlp/raw-invpc:
+  #   endpoint: tempo.observability.svc:4317
+  #   tls: { insecure: true }
+
+service:
+  extensions: [health_check, zpages]
+  telemetry:
+    logs: { level: info }
+    metrics: { level: detailed }            # the Collector's own health metrics
+  pipelines:
+    # (1) FULL span stream → spanmetrics (NO sampling here → accurate RED metrics).
+    traces/metrics-source:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [spanmetrics]
+
+    # (2) SRE-sampled traces → Datadog.
+    traces/sre:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling/sre, batch]
+      exporters: [datadog]
+
+    # (3) LLM-sampled, PII-redacted traces → Langfuse.
+    traces/llm:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/redact, tail_sampling/llm, batch]
+      exporters: [otlphttp/langfuse]
+
+    # (4) Metrics from spanmetrics → Datadog (computed on 100% of spans).
+    metrics/spanmetrics:
+      receivers: [spanmetrics]
+      processors: [memory_limiter, batch]
+      exporters: [datadog]
+
+# NOTE: the otlp receiver fans the same spans into pipelines (1)(2)(3), so tail_sampling/sre
+# and tail_sampling/llm each buffer their own copy → ~2× tail-buffer memory. If that's too
+# costly, run ONE tail_sampling with the union of policies and route to both backends,
+# accepting that both then get the same kept set.
+
+# =============================================================================
+# APPENDIX — Tier-1 "agent" collector config (run as a SEPARATE deployment).
+# Stateless; its only job is to shard spans by trace ID so each whole trace reaches one
+# Tier-2 pod. Save as its own file and run a fleet of these in front of Tier-2.
+#
+#   receivers:
+#     otlp:
+#       protocols:
+#         grpc: { endpoint: 0.0.0.0:4317 }
+#   processors:
+#     memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 25 }
+#   exporters:
+#     loadbalancing:
+#       routing_key: traceID          # all spans of a trace → same backend pod
+#       protocol:
+#         otlp: { tls: { insecure: true } }
+#       resolver:
+#         dns:                         # headless k8s Service of the Tier-2 tail-samplers
+#           hostname: otel-tailsampler-headless.observability.svc.cluster.local
+#           port: 4317
+#   service:
+#     pipelines:
+#       traces:
+#         receivers: [otlp]
+#         processors: [memory_limiter]
+#         exporters: [loadbalancing]
+#
+# conversation_id note: loadbalancing routes by traceID (or service), not arbitrary attrs.
+# Here a trace == one /invoke turn and a conversation spans many traces, so tail decisions
+# are per-TURN. conversation_id is on every kept span (you can still pivot), but keeping a
+# WHOLE conversation when any turn is interesting needs conversation-level co-location
+# (custom routing) — build that only if incident retros actually require it.
+# =============================================================================

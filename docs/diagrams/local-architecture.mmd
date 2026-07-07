@@ -1,0 +1,45 @@
+flowchart TB
+    user(["🟦 User / Browser"]):::ext
+
+    subgraph stack["Local Docker Compose stack (one network)"]
+        direction TB
+        fe["🟩 frontend :5173<br/>React SPA · Okta OIDC PKCE login"]:::real
+        okta["🟨 mock-okta :8081<br/>OIDC: PKCE→user JWT (RS256)<br/>client_credentials→M2M JWT (HS256)"]:::mock
+
+        subgraph rt["🟩 runtime :8080 — AgentCore Runtime stand-in"]
+            direction TB
+            authz["Inbound JWT authorizer<br/>verify JWKS · aud · scope → else 401"]
+            agent["LangGraph ReAct agent<br/>llm ⇄ action loop (chooses+chains tools)"]
+            ident["AgentCore Identity shim<br/>workload identity + token vault<br/>@requires_access_token (M2M)"]
+        end
+
+        kong["🟩 kong :8000<br/>MODEL gateway · ai-proxy (jwt)"]:::real
+        acgw["🟨 mock-agentcore-gateway :9000<br/>MCP TOOL gateway (stands in for AgentCore Gateway)<br/>inbound JWT + per-tool scope<br/>tools: retrieve_documents · submit_ticket"]:::mock
+        bedrock["🟨 mock-bedrock<br/>OpenAI-shaped model upstream"]:::mock
+        mem["🟨 mock-memory<br/>AgentCore Memory contract"]:::mock
+        pg[("🟩 pgvector<br/>Postgres + vectors + memory")]:::real
+        otelc["🟩 otel-collector<br/>single OTLP egress · fans out<br/>PII redaction on the Langfuse pipeline"]:::real
+        jaeger["🟩 jaeger :16686<br/>OTel traces (RAW content)"]:::real
+        lf["🟩 langfuse :3000<br/>(optional override · REDACTED content)"]:::real
+    end
+
+    user -->|"1 · sign in"| fe
+    fe -->|"authorize + token (PKCE)"| okta
+    user -->|"2 · POST /invoke + Bearer USER JWT"| authz
+    authz -->|"sub = actor_id"| agent
+    agent --> ident
+    ident -->|"mint scoped M2M JWT (model.invoke / tool.retrieve / tool.submit_ticket)"| okta
+
+    agent ==>|"3a · reasoning · Bearer M2M JWT"| kong
+    kong -->|"llm/v1/chat"| bedrock
+    agent ==>|"3b · tool calls · MCP + Bearer M2M JWT"| acgw
+    acgw -->|"vector search"| pg
+    agent -->|"read/write turns · actor_id=sub"| mem
+    mem --> pg
+    agent -. "OTel spans + prompt/response (conversation_id)" .-> otelc
+    otelc -->|"RAW"| jaeger
+    otelc -. "PII-redacted" .-> lf
+
+    classDef real fill:#ecfdf5,stroke:#10b981,color:#064e3b;
+    classDef mock fill:#fff7ed,stroke:#fb923c,stroke-dasharray:5 3,color:#7c2d12;
+    classDef ext  fill:#eff6ff,stroke:#3b82f6,color:#1e3a8a;

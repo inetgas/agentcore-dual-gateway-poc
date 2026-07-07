@@ -1,0 +1,55 @@
+flowchart TB
+    user(["User / Browser"]):::ext
+    okta["Okta (SaaS IdP)<br/>OIDC PKCE · M2M client_credentials · JWKS"]:::ext
+
+    subgraph edge["Edge"]
+        cf["CloudFront + WAF"]:::aws
+        s3["S3 — React SPA (static)"]:::aws
+    end
+
+    subgraph appacct["AWS account: App / Agent (private VPC)"]
+        direction TB
+        rt["AgentCore Runtime — orchestrator<br/>inbound JWT authorizer + LangGraph ReAct agent"]:::aws
+        acgw["AgentCore Gateway — MCP tool gateway<br/>inbound OAuth (JWT) + fine-grained per-tool authz<br/>tools: retrieve_documents · submit_ticket"]:::aws
+        idn["AgentCore Identity<br/>workload identity + token vault (M2M)"]:::aws
+        mem["AgentCore Memory<br/>actor_id = user JWT sub"]:::aws
+    end
+
+    subgraph gwacct["AWS account: Gateway / shared services"]
+        kong["Kong Konnect (Enterprise) — MODEL gateway<br/>openid-connect · ai-proxy-advanced · ai-sanitizer (PII)"]:::gw
+    end
+
+    subgraph aiacct["AWS account: AI / Data (private subnets)"]
+        direction TB
+        bedrock["Amazon Bedrock<br/>Claude (reasoning) · Titan (embeddings)"]:::aws
+        rds[("RDS Postgres + pgvector")]:::data
+        ticket["Ticketing API / Lambda<br/>(submit_ticket target)"]:::aws
+    end
+
+    subgraph obs["AWS account: Observability / Security"]
+        otelc["OTel Collector<br/>PII redaction (Decision 4) · fan-out"]:::gw
+        lf["Langfuse<br/>LLM views · redacted content"]:::aws
+        dd["Datadog + CloudWatch<br/>SRE views"]:::aws
+    end
+
+    user -->|HTTPS| cf --> s3
+    s3 -->|OIDC Authorization Code + PKCE| okta
+    user -->|"POST /invoke + Bearer USER JWT (HTTPS/ALB)"| rt
+    rt -->|validate JWKS / aud / scope| okta
+    rt --> idn
+    idn -->|mint scoped M2M JWT| okta
+
+    rt ==>|reasoning · Bearer M2M JWT| kong
+    kong -->|llm/v1/chat · embeddings| bedrock
+    rt ==>|tool calls · MCP + Bearer M2M JWT| acgw
+    acgw -->|retrieve target| rds
+    acgw -->|submit_ticket target| ticket
+    rt -->|read/write turns| mem
+    rt -. "OTel spans + content" .-> otelc
+    otelc -. redacted .-> lf
+    otelc -. metrics/traces .-> dd
+
+    classDef aws  fill:#fff3e0,stroke:#ef6c00,color:#7c2d12;
+    classDef data fill:#e3f2fd,stroke:#1565c0,color:#0d47a1;
+    classDef gw   fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
+    classDef ext  fill:#f5f5f5,stroke:#616161,color:#212121;

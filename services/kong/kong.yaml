@@ -1,0 +1,44 @@
+_format_version: "3.0"
+
+# One consumer = the mvp-orchestrator service principal. Its JWTs (iss-matched)
+# are validated by the OSS `jwt` plugin against the shared HS256 secret.
+# (PROD: Okta RS256 + JWKS validated by the enterprise openid-connect plugin.)
+consumers:
+  - username: mvp-orchestrator
+    jwt_secrets:
+      - key: "http://localhost:8081/oauth2/default"
+        algorithm: HS256
+        secret: "mock-okta-hs256-shared-secret"
+
+services:
+  # --- Model routes -> mock Bedrock (ask #1) --------------------------------
+  - name: models
+    url: http://mock-bedrock:8080
+    routes:
+      # reasoning: REAL ai-proxy (OSS) transform -> mock Bedrock
+      - name: chat
+        paths: ["/v1/chat/completions"]
+        protocols: ["http"]
+        strip_path: false
+        plugins:
+          - name: jwt
+          - name: ai-proxy
+            config:
+              route_type: llm/v1/chat
+              auth: { header_name: Authorization, header_value: "Bearer mock-key" }
+              model:
+                provider: openai
+                name: mock-bedrock-claude
+                options: { upstream_url: "http://mock-bedrock:8080/v1/chat/completions" }
+      # embedding: plain Kong proxy -> mock Bedrock (ai-proxy embeddings transform
+      # is enterprise/ai-proxy-advanced; the call still traverses Kong here)
+      - name: embeddings
+        paths: ["/v1/embeddings"]
+        protocols: ["http"]
+        strip_path: false
+        plugins:
+          - name: jwt
+
+  # Tool routes removed: tools are now exposed by AgentCore Gateway (MCP), not Kong.
+  # Kong is the MODEL gateway only (chat + embeddings above). Per-tool scope-gating
+  # (tool.retrieve / tool.submit_ticket) now happens at AgentCore Gateway.

@@ -1,0 +1,140 @@
+# agentcore-dual-gateway-poc — optional Langfuse v3 (self-contained, no external dependency).
+#
+# Bring up the PoC *with* Langfuse:
+#   docker compose -f docker-compose.yml -f docker-compose.langfuse.yml up --build
+#
+# Langfuse UI:  http://localhost:3000   (login demo@example.com / demodemo123)
+#   This override ONLY starts the Langfuse containers. The OTel Collector already runs a
+#   single always-on config that forwards a PII-REDACTED copy to Langfuse (and the raw
+#   copy to Jaeger) — so once these containers are up, redacted traces flow with no
+#   Collector change. (That's deliberate: nothing here touches the Collector, so a later
+#   base-only command like `docker compose run tests` can't break Langfuse forwarding.)
+#   Open project "mvp-orchestrator" → Tracing to see the loop with prompt/response
+#   (redacted), gen_ai.* / mcp.*, grouped by conversation_id. Org/project/user + API keys
+#   are auto-provisioned on first boot via LANGFUSE_INIT_*.
+#
+# Without this file, `docker compose up` runs Jaeger-only (lighter, clean logs).
+#
+# NOTE: Langfuse v3 is a 6-container stack (web, worker, its own postgres,
+# clickhouse, minio, redis). First boot pulls images and runs migrations — give it
+# ~60-90s before traces appear. If ingestion silently stalls, it's almost always
+# Docker low-on-disk → MinIO writes fail: `docker system prune -af` and restart.
+
+services:
+  # This override only adds the Langfuse stack — it intentionally does NOT touch the
+  # otel-collector (its single always-on config already forwards a redacted copy here).
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    depends_on:
+      lf-postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      minio: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgresql://postgres:lf_pg_demo@lf-postgres:5432/langfuse
+      SALT: demo-salt-change-me
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: demo-nextauth-secret-change-me
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: lf_ch_demo
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: lf_minio_demo
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_INIT_ORG_ID: example-corp
+      LANGFUSE_INIT_ORG_NAME: Example Corp
+      LANGFUSE_INIT_PROJECT_ID: mvp-orchestrator
+      LANGFUSE_INIT_PROJECT_NAME: mvp-orchestrator
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-demo-0000000000000000
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-demo-0000000000000000
+      LANGFUSE_INIT_USER_EMAIL: demo@example.com
+      LANGFUSE_INIT_USER_NAME: Demo
+      LANGFUSE_INIT_USER_PASSWORD: demodemo123
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    depends_on:
+      lf-postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      minio: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgresql://postgres:lf_pg_demo@lf-postgres:5432/langfuse
+      SALT: demo-salt-change-me
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: lf_ch_demo
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: lf_minio_demo
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      TELEMETRY_ENABLED: "false"
+
+  lf-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: lf_pg_demo
+      POSTGRES_DB: langfuse
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes: ["lf_pg:/var/lib/postgresql/data"]
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: lf_ch_demo
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    volumes: ["lf_ch:/var/lib/clickhouse"]
+
+  minio:
+    image: minio/minio
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["mkdir -p /data/langfuse && minio server /data --console-address :9001"]
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: lf_minio_demo
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes: ["lf_minio:/data"]
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  lf_pg:
+  lf_ch:
+  lf_minio:
