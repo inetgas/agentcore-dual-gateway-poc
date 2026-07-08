@@ -11,10 +11,10 @@
 ![Frontend](https://img.shields.io/badge/Frontend-React%20%2B%20Vite-646CFF)
 ![Agent](https://img.shields.io/badge/Agent-LangGraph-orange)
 
-Companion code to the article **Building a Production-Grade Agentic AI Platform on AWS
-Bedrock AgentCore: What Decisions were Made and Why**. The article explains the *why*
-(and describes the real production platform); this repo is a local, runnable *how*.
-Article links can be added here after publication.
+Companion code to the LinkedIn article **[Building a Production-Grade Agentic AI Platform on AWS
+Bedrock AgentCore](https://www.linkedin.com/pulse/building-production-grade-agentic-ai-platform-aws-bedrock-wang-zjwec/)**.
+The article explains the *why* (and describes the real production platform); this repo is a local,
+runnable *how*.
 
 > **What's faithful vs. swapped.** The blog describes a production system on real AWS services.
 > This POC keeps the same **structure and contracts** but runs entirely on your laptop with
